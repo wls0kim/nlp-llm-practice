@@ -1,0 +1,566 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(reticulate)
+library(tidyverse)
+library(quanteda)
+library(stm) # Structural Topic Modeling
+library(showtext)
+library(ggplot2)
+```
+
+- 공무원 온라인 리뷰의 장점, 단점 텍스트를 구조적 토픽 모델링(STM)으로 분석
+- 총 만족도(저만족, 고만족)에 따른 토픽 비중 차이 확인
+
+- 필요한 파일: `raw_data.csv` (리뷰 원자료, 비공개)
+- 순서: 자료 불러오기 → 형태소 분석과 정제 → 문서-단어 행렬 → 토픽 수 탐색 → 장점, 단점 STM → 토픽 이름과 평균 비중 → 만족도 공변량 효과
+
+## 1. 자료 불러오기
+
+- 공무원 온라인 리뷰의 장점, 단점 텍스트와 총 만족도(1~5점)
+- 장점, 단점, 만족도 중 하나라도 비어 있는 리뷰 제외
+
+```{r data-loading}
+# === 1. 원본 데이터 불러오기 ===
+# CP949 인코딩으로 저장된 CSV 파일 불러오기
+blind_reviews <- read.csv("raw_data.csv", fileEncoding = "cp949")
+
+# 데이터 구조 확인
+glimpse(blind_reviews)
+
+# === 2. 분석에 필요한 변수 선택 ===
+blind_reviews <- blind_reviews %>%
+  transmute(
+    pros  = pros.tmp, # 장점 텍스트
+    cons  = cons.tmp, # 단점 텍스트
+    total = total.tmp # 만족도(1~5점 척도)
+  ) %>%
+  filter(!is.na(pros), !is.na(cons), !is.na(total)) %>% # 결측치 제거
+  filter(pros != "", cons != "") # 빈 문자열 제거
+
+# 데이터 구조 재확인
+glimpse(blind_reviews)
+cat("최종 분석 데이터 수:", nrow(blind_reviews))
+```
+
+## 2. 텍스트 전처리
+
+### 2.1. 형태소 분석기
+
+- Kiwi 형태소 분석기 사용
+
+```{r preprocessing-tokenizer}
+kiwi <- import("kiwipiepy")
+tokenizer <- kiwi$Kiwi()
+```
+
+### 2.2. 정제와 토큰화
+
+- 사용자 사전(공직, 직장 용어), 동의어 통일, 불용어 제거
+- 명사, 동사, 형용사, 부사만 추출, 한 글자 단어 제외
+- 만족도 1~2점 → 저만족(0), 3~5점 → 고만족(1)
+
+```{r preprocessing-cleansing and tokenization}
+# === 1. 사용자 사전 등록 ===
+# 공무원/직장 관련 도메인 특화 용어를 사용자 사전에 추가
+user_words <- c(
+  "워라밸", "정년보장", "월급상승", "조직문화", "순환근무", 
+  "육아휴직", "주5일", "상명하복", "직렬", "꼰대", 
+  "부바부", "팀바팀", "사바사", "mz세대", "공무원연금", 
+  "기여금", "민원인", "당직근무", "비연고지", "가스라이팅",
+  "칼퇴근", "네임밸류", "자기계발비", "고인물", "칼퇴",
+  "성과급", "연공서열"
+)
+# 각 단어를 일반명사로 등록
+for (word in user_words) {
+  tokenizer$add_user_word(word, "NNG")
+}
+
+# === 2. 동의어 사전 정의 ===
+# 같은 의미를 가졌지만 표기만 다른 단어들을 하나로 통일
+synonyms <- c(
+  "워라벨" = "워라밸", "업무양" = "업무량", "부서바이부서" = "부바부", 
+  "팀바이팀" = "팀바팀", "자기개발" = "자기계발", "칼퇴근" = "칼퇴", 
+  "MZ세대" = "mz세대", "mZ세대" = "mz세대", "Mz세대" = "mz세대", 
+  "네임벨류" = "네임밸류", "내임밸류" = "네임밸류", "사람바이사람" = "사바사", 
+  "성과금" = "성과급", "카톡" = "카카오톡", "워크앤라이프" = "워라밸", 
+  "워크라이프밸런스" = "워라밸", "워크앤라이프밸런스" = "워라밸", "자기개발비" = "자기계발비"
+)
+
+# === 3. 토큰화 함수 정의 ===
+tokenize_with_synonyms <- function(text_vector, synonym_dict = synonyms) {
+  tokens_list <- map(text_vector, function(text) {
+    # (1) 결측치 또는 빈 문자열 처리
+    if (is.na(text) || text == "" || is.null(text)) { 
+      return(character(0))  # 빈 벡터 반환
+    }
+    
+    # (2) 동의어 사전을 이용해 치환
+    for (i in seq_along(synonym_dict)) {
+      pattern <- names(synonym_dict)[i]
+      replacement <- synonym_dict[i]
+      text <- str_replace_all(text, fixed(pattern), replacement)
+    }
+    
+    # (3) Kiwi로 형태소 분석
+    result <- tokenizer$tokenize(text)
+    
+    # (4) 원하는 품사만 추출 (명사, 동사, 형용사, 부사)
+    tokens <- map(result, function(token) {
+      tag <- token$tag
+      form <- token$form
+      if (tag %in% c("NNG", "NNP", "VV", "VA", "MAG")) { 
+        return(form) }
+    }) %>% 
+      compact() %>% 
+      unlist()
+    
+    # (5) 한 글자 단어 제거
+    tokens <- tokens[nchar(tokens) > 1]
+    
+    return(tokens)
+  })
+  return(tokens_list)
+}
+
+# === 4. 불용어 사전 정의 ===
+# 의미가 없거나 분석에 불필요한 단어 사전에 따로 저장
+customstopwords <- c(
+  "하다", "있다", "되다", "회사", "단점", "장점", 
+  "가량", "가지", "각", "수", "곳", "뿐", "등", "만", 
+  "시", "때", "나", "듯", "간", "편", "외", "년", 
+  "차", "것", "날", "분", "중", "줄", "내", "뭣", 
+  "급", "점", "원", "데", "그", "이", "저", "어떤",
+  "사람", "생각", "느낌", "정도", "경우"
+)
+
+# 불용어 제거 함수
+remove_stop <- function(token_list, stopwords) {
+  map(token_list, ~ .x[!.x %in% stopwords]) 
+  }
+
+tokens_to_text <- function(token_list) {
+  map_chr(token_list, ~ paste(.x, collapse = " ")) 
+  }
+
+# === 5. 장점/단점 텍스트 전처리 ===
+
+# 장점 텍스트 토큰화
+blind_reviews$pros_tokens <- tokenize_with_synonyms(blind_reviews$pros)
+
+# 단점 텍스트 토큰화
+blind_reviews$cons_tokens <- tokenize_with_synonyms(blind_reviews$cons)
+
+# 불용어 제거
+blind_reviews$pros_tokens_clean <- remove_stop(blind_reviews$pros_tokens, customstopwords)
+blind_reviews$cons_tokens_clean <- remove_stop(blind_reviews$cons_tokens, customstopwords)
+
+# === 6. 유효 문서 필터링 및 데이터 분리 ===
+
+# 토큰이 1개 이상 있는 문서만 유효한 문서로 여김
+pros_valid <- map_int(blind_reviews$pros_tokens_clean, length) > 0
+cons_valid <- map_int(blind_reviews$cons_tokens_clean, length) > 0
+
+# 유효 문서 선택 + 토큰을 텍스트로 변환
+blind_reviews_pros <- blind_reviews[pros_valid, ] %>% 
+  mutate(pros_text_processed = tokens_to_text(pros_tokens_clean))
+blind_reviews_cons <- blind_reviews[cons_valid, ] %>% 
+  mutate(cons_text_processed = tokens_to_text(cons_tokens_clean))
+
+# === 7. 공변량 생성 ===
+# 점수를 기준으로 "저만족(0)" vs "고만족(1)" 그룹으로 이분화 진행
+# 1-2점: 저만족(0), 3-5점: 고만족(1)
+blind_reviews_pros <- blind_reviews_pros %>% 
+  mutate(level = factor(ifelse(total %in% c(1,2), 0, 1)))
+blind_reviews_cons <- blind_reviews_cons %>% 
+  mutate(level = factor(ifelse(total %in% c(1,2), 0, 1)))
+
+# === 8. 전처리 완료 데이터 저장 ===
+# 분석에 필요한 변수만 선택해 저장
+pros_data_save <- blind_reviews_pros %>%
+  select(pros_text_processed, level)
+
+cons_data_save <- blind_reviews_cons %>%
+  select(cons_text_processed, level)
+
+write.csv(pros_data_save, "pros_data_processed.csv", row.names = FALSE, fileEncoding = "cp949")
+write.csv(cons_data_save, "cons_data_processed.csv", row.names = FALSE, fileEncoding = "cp949")
+```
+
+### 2.3. 문서-단어 행렬과 STM 입력
+
+- quanteda로 문서-단어 행렬(DFM) 생성, 5회 미만 등장 단어 제거
+
+```{r preprocessing-vectorization}
+make_stm_input <- function(df, text_field, meta_var = "level", min_tf = 5) {
+  # (1) Quanteda corpus 생성
+  corp <- corpus(df, text_field = text_field)
+  
+  # (2) 공변량을 문서 변수로 저장
+  docvars(corp, meta_var) <- df[[meta_var]]
+  
+  # (3) 토큰화
+  toks <- tokens(corp, what = "fastestword")
+  
+  # (4) DFM 생성
+  dfm_obj <- dfm(toks)
+  
+  # (5) 희소 단어 제거
+  dfm_obj <- dfm_trim(dfm_obj, min_termfreq = min_tf)
+  
+  # (6) DFM을 STM 패키지가 요구하는 형식으로 변환
+  stm_input <- convert(dfm_obj, to = "stm")
+  
+  # (7) 필요한 요소 반환
+  list(documents = stm_input$documents, # 문서-단어 희소 행렬
+       vocab = stm_input$vocab, # 전체 어휘 목록
+       meta = stm_input$meta, # 메타데이터
+       dfm = dfm_obj # DFM 객체
+       )
+}
+
+# STM 입력 생성
+stm_pros <- make_stm_input(blind_reviews_pros, "pros_text_processed")
+stm_cons <- make_stm_input(blind_reviews_cons, "cons_text_processed")
+
+cat("DFM(장점) 요약:\n"); print(stm_pros$dfm)
+cat("DFM(단점) 요약:\n"); print(stm_cons$dfm)
+```
+
+## 3. 토픽 수 탐색
+
+- `searchK()`로 K = 10~35의 held-out 가능도, 잔차, 의미적 일관성, 배타성 비교
+- 지표와 토픽 해석 가능성을 함께 검토해 장점, 단점 모두 K = 20 선택
+
+```{r modeling-searchK}
+# === 1. 최적 토픽 수 탐색 ===
+# 테스트할 토픽 수 후보
+K_candidates <- c(10, 15, 20, 25, 30, 35)
+
+# SearchK 실행 함수 정의
+run_searchK <- function(stm_in, K_vec, save_prefix) {
+  
+  # searchK로 각 K에 대해 모델 학습 및 지표 계산
+  s <- searchK(
+    documents = stm_in$documents, 
+    vocab = stm_in$vocab, 
+    K = K_vec, 
+    prevalence = ~ level, 
+    data = stm_in$meta, 
+    init.type = "Spectral", 
+    verbose = FALSE
+    )
+  
+  # 결과 RDS로 저장
+  saveRDS(s, paste0(save_prefix, ".rds"))
+  
+  # 지표 정리
+  results <- data.frame(
+    K = unlist(s$results$K), # 토픽 수
+    Semantic_Coherence = round(unlist(s$results$semcoh), 3), # 의미적 일관성
+    Exclusivity = round(unlist(s$results$exclus), 3), # 배타성
+    HeldOut_Likelihood = round(unlist(s$results$heldout), 3), # Held-Out 가능도
+    Residuals = round(unlist(s$results$residual), 3) # 잔차
+  )
+  
+  write.csv(results, paste0(save_prefix, "_table.csv"), row.names = FALSE)
+  
+  return(list(s=s, results=results))
+}
+```
+
+```{r result-pros searchK}
+res_pros_k <- run_searchK(stm_pros, K_candidates, "pros_searchK")
+
+png("pros_searchK_plot.png", width = 1200, height = 800, res = 120)
+plot(res_pros_k$s)
+dev.off()
+
+plot(res_pros_k$s)
+```
+
+```{r result-cons searchK}
+res_cons_k <- run_searchK(stm_cons, K_candidates, "cons_searchK")
+
+png("cons_searchK_plot.png", width = 1200, height = 800, res = 120)
+plot(res_cons_k$s)
+dev.off()
+
+plot(res_cons_k$s)
+```
+
+## 4. 장점 토픽
+
+### 4.1. STM 적합
+
+```{r result-pros model}
+fit_stm <- function(stm_in, K, save_name, seed = 37) {
+  m <- stm(documents = stm_in$documents, 
+           vocab = stm_in$vocab, 
+           data = stm_in$meta,
+           K = K, 
+           prevalence = ~ level, 
+           max.em.its = 50, 
+           init.type = "Spectral", 
+           verbose = FALSE, 
+           seed = seed)
+
+  saveRDS(m, save_name)
+  
+  return(m)
+}
+
+meta_fit20pros <- fit_stm(stm_pros, 20, "pros_final_model.rds")
+```
+
+### 4.2. 토픽 이름
+
+- 상위 단어와 대표 문서를 검토해 이름 부여
+
+```{r result-pros topic naming}
+sageLabels(meta_fit20pros, n = 10)
+
+# 장점 토픽 라벨
+proslabel_k20 <- c(
+  "칼퇴근",                      # Topic 1: 가능, 칼되, 부서
+  "연고지 근무",                 # Topic 2: 지방, 지역, 근무지
+  "사기업 대비 적은 압박",       # Topic 3: 사기업, 압박, 스트레스
+  "자기계발 기회",               # Topic 4: 자기, 계발, 능력
+  "호봉제",                      # Topic 5: 급여, 호봉, 오르
+  "정시 퇴근",                   # Topic 6: 퇴근, 시간, 정시
+  "고용불안 부재",               # Topic 7: 짤리, 걱정, 안정감
+  "정년보장",                    # Topic 8: 안정, 보장, 정년
+  "공무원 긍정적 인식",          # Topic 9: 공무원, 나오, 좋아하, 인식
+  "휴가 사용의 자유로움",        # Topic 10: 자유, 연가, 연차
+  "연금 및 정년보장",            # Topic 11: 정년보장, 연금, 밥통
+  "워라밸",                      # Topic 12: 워라밸, 부바부, 만족
+  "수평적 조직문화",             # Topic 13: 문화, 수평, 조직
+  "근무 환경 및 수당",           # Topic 14: 근무, 수당, 환경
+  "국가에 대한 사명감/자부심",   # Topic 15: 보람, 국가, 자부심
+  "방학 존재 (교사)",            # Topic 16: 방학, 교사, 학생
+  "직업적 자부심",               # Topic 17: 직업, 부모, 자랑
+  "육아 및 복지 제도",           # Topic 18: 육아휴직, 복지, 휴직
+  "업무의 단순성",               # Topic 19: 업무, 강도, 약하
+  "심리적 편안함"                # Topic 20: 편하, 마음, 안정
+)
+```
+
+### 4.3. 토픽별 평균 비중
+
+```{r result-pros topic summary}
+showtext_auto()
+
+png("pros_topic_summary.png", width = 1500, height = 1200, res = 120)
+plot(meta_fit20pros, 
+     type = "summary", 
+     custom.labels = proslabel_k20, 
+     main = "장점: 평균 토픽 비율",  
+     xlab = "평균 출현 비율",
+     xlim = c(0, 0.11))
+dev.off()
+
+plot(meta_fit20pros, type = "summary", custom.labels = proslabel_k20, main = "장점: 평균 토픽 비율", xlab = "평균 출현 비율", xlim = c(0, 0.11))
+```
+
+## 5. 단점 토픽
+
+### 5.1. STM 적합
+
+```{r result-cons model}
+meta_fit20cons <- fit_stm(stm_cons, 20, "cons_final_model.rds")
+```
+
+### 5.2. 토픽 이름
+
+- 여러 주제가 섞인 토픽은 이름을 비워 두고 해석에서 제외
+
+```{r result-cons topic naming}
+sageLabels(meta_fit20cons, n = 10)
+
+# 단점 토픽 라벨
+conslabel_k20 <- c(
+  "잦은 인사이동",               # Topic 1: 업무, 바뀌, 인사이동
+  "학부모/학생 민원 (교사)",     # Topic 2: 힘들, 학부모, 학생
+  "책임 떠넘기기",               # Topic 3: 책임, 눈치, 돌아가
+  "수직적 조직문화",             # Topic 4: 문화, 보수, 수직
+  "악성민원",                    # Topic 5: 민원인, 상대, 악성
+  " ",                           # Topic 6 -> 여러 주제 혼합으로 삭제
+  "연금 감액",                   # Topic 7: 연금, 복지, 수준
+  "불명확한 업무 체계",          # Topic 8: 모르, 신규, 인수인계
+  " ",                           # Topic 9 -> 여러 주제 혼합으로 삭제
+  "커리어 향상의 어려움",        # Topic 10: 커리어, 이직, 향상
+  "초과근무 및 비상근무",        # Topic 11: 주말, 비상, 초과근무
+  "낮은 임금상승률",             # Topic 12: 물가, 상승, 임금
+  "민원 스트레스",               # Topic 13: 민원, 스트레스, 떼쓰
+  "꼰대 상사",                   # Topic 14: 꼰대, 상사, 보고
+  " ",                           # Topic 15 -> 여러 주제 혼합으로 삭제
+  "자기계발의 어려움",           # Topic 16: 발전, 성장, 안주
+  "순환근무",                    # Topic 17: 승진, 순환, 이동
+  "외부 발령",                   # Topic 18: 인사, 발령, 기관
+  "보람 및 보상 부재",           # Topic 19: 열심히, 보람, 보상
+  "타지 근무"                    # Topic 20: 차이, 타지, 환경, 생활
+)
+```
+
+### 5.3. 토픽별 평균 비중
+
+```{r result-cons topic summary}
+showtext_auto()
+
+png("cons_topic_summary.png", width = 1500, height = 1200, res = 120)
+plot(meta_fit20cons, 
+     type = "summary", 
+     custom.labels = conslabel_k20, 
+     main = "단점: 평균 토픽 비율", 
+     xlab = "평균 출현 비율",
+     xlim = c(0, 0.11))
+dev.off()
+
+plot(meta_fit20cons, type = "summary", custom.labels = conslabel_k20, main = "단점: 평균 토픽 비율", xlab = "평균 출현 비율", xlim = c(0, 0.11))
+```
+
+## 6. 만족도에 따른 토픽 비중 차이
+
+- 만족 수준을 토픽 비중의 공변량으로 넣어 `estimateEffect()`로 추정
+- 계수가 양수면 고만족 집단에서 더 많이 언급된 토픽
+
+### 6.1. 장점 토픽
+
+```{r result-pros effect}
+# === 1. 공변량 추정 ===
+preppros20 <- estimateEffect(formula = ~ level, # 종속변수: 토픽 비중, 독립변수: 만족도
+                             stmobj = meta_fit20pros, 
+                             metadata = stm_pros$meta, 
+                             uncertainty = "Global")
+
+capture.output(summary(preppros20), file = "pros_reg_results.txt")
+
+# === 2. 유의한 토픽 확인 (p < 0.05) ===
+get_sig_topics <- function(prep_obj, labels, alpha = 0.05, cov_row = "level1") {
+  
+  # estimateEffect 결과에서 summary 사용
+  sum_obj <- summary(prep_obj)
+  
+  # 각 토픽의 회귀계수 테이블에서 level1 행의 통계량 확인
+  out <- do.call(rbind, lapply(seq_along(sum_obj$tables), function(i) {
+    tab <- sum_obj$tables[[i]]
+    row_idx <- which(rownames(tab) == cov_row)
+    
+    data.frame(
+      Topic    = i, # 토픽 번호
+      Label    = labels[i], # 토픽 라벨
+      Estimate = tab[row_idx, "Estimate"], # 회귀계수
+      Std_Error= tab[row_idx, "Std. Error"], # 표준 오차
+      P_value  = tab[row_idx, "Pr(>|t|)"] # p-value
+    )
+  }))
+  
+  # 유의한 토픽만 필터링한 후, 회귀계수 내림차순으로 정렬
+  out %>%
+    filter(P_value < alpha) %>%
+    arrange(desc(Estimate))
+}
+
+sig_pros <- get_sig_topics(preppros20, proslabel_k20, alpha = 0.05)
+write.csv(sig_pros, "pros_reg_sig.csv", row.names = FALSE)
+
+print(sig_pros)
+
+# === 3. 효과 추정 결과를 데이터프레임으로 변환 ===
+make_effect_df <- function(prep_obj, labels, cov_row = "level1", alpha = 0.05) {
+    sum_obj <- summary(prep_obj)
+  
+  # 각 토픽의 추정치, 표준오차, p-value 결합
+  df <- do.call(rbind, lapply(seq_along(sum_obj$tables), function(i) {
+    tab <- sum_obj$tables[[i]]
+    row_idx <- which(rownames(tab) == cov_row)
+    
+    est <- tab[row_idx, "Estimate"] # 회귀계수
+    se  <- tab[row_idx, "Std. Error"] # 표준 오차
+    p   <- tab[row_idx, "Pr(>|t|)"] # p-value
+    
+    data.frame(
+      Topic = i,
+      Label = labels[i],
+      Estimate = est,
+      Lower = est - 1.96 * se,   # 95% CI 하한
+      Upper = est + 1.96 * se,   # 95% CI 상한
+      P_value = p
+    )
+  }))
+  
+  df %>%
+    mutate(
+      # 유의성과 방향에 따라 범주 추가
+      Significant = case_when(
+        P_value < alpha & Estimate > 0 ~ "만족도 높음", # 만족도가 높은 그룹에서 많이 언급
+        P_value < alpha & Estimate < 0 ~ "만족도 낮음", # 만족도가 낮은 그룹에서 많이 언급
+        TRUE                           ~ "유의하지 않음" # 유의하지 않음
+      )
+    )
+}
+
+# === 4. 시각화 함수 정의 ===
+plot_sig_highlight <- function(effect_df, title_name) {
+  ggplot(effect_df, aes(x = reorder(Label, Estimate), y = Estimate, color = Significant)) +
+    # 기준선 (회귀계수 = 0)
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    
+    # 95% 신뢰구간 (에러바)
+    geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, size = 0.8) +
+    
+    # 추정치 점
+    geom_point(size = 3) +
+    coord_flip() +
+    
+    # 그래프 색 설정: 높은 만족(파랑), 낮은 만족(빨강), 유의하지 않음(회색)
+    scale_color_manual(values = c(
+      "만족도 높음" = "#2c7bb6",
+      "만족도 낮음"  = "#d7191c",
+      "유의하지 않음"   = "gray80"
+    )) +
+    labs(
+      title = title_name,
+      x = "토픽",
+      y = "회귀계수 (고만족 - 저만족)",
+      color = "p < .05"
+    ) +
+    theme_minimal(base_family = "NanumGothic") +
+    theme(
+      legend.position = "bottom",
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+}
+
+df_pros_eff <- make_effect_df(preppros20, proslabel_k20, alpha = 0.05)
+p_pros <- plot_sig_highlight(df_pros_eff, "장점: 토픽별 회귀계수")
+ggsave("pros_reg_sig_highlight.png", p_pros, width = 10, height = 8, dpi = 300)
+
+print(p_pros)
+```
+
+### 6.2. 단점 토픽
+
+```{r result-cons effect}
+# === 1. 공변량 추정 ===
+prepcons20 <- estimateEffect(formula = ~ level, # 종속변수: 토픽 비중, 독립변수: 만족도
+                             stmobj = meta_fit20cons, 
+                             metadata = stm_cons$meta, 
+                             uncertainty = "Global")
+
+capture.output(summary(prepcons20), file = "cons_reg_results.txt")
+
+# === 2. 유의한 토픽 확인 (p < 0.05) ===
+sig_cons <- get_sig_topics(prepcons20, conslabel_k20, alpha = 0.05)
+write.csv(sig_cons, "cons_reg_sig.csv", row.names = FALSE)
+
+print(sig_cons)
+
+# === 3. 시각화 ===
+df_cons_eff <- make_effect_df(prepcons20, conslabel_k20, alpha = 0.05)
+p_cons <- plot_sig_highlight(df_cons_eff, "단점: 토픽별 회귀계수")
+ggsave("cons_reg_sig_highlight.png", p_cons, width = 10, height = 8, dpi = 300)
+
+print(p_cons)
+```
