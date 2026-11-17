@@ -26,10 +26,17 @@
 - 별점을 저만족과 고만족으로 나눠 공변량으로 넣고 구조적 토픽 모델링(STM) 적합, `searchK`로 토픽 수 결정
 - 만족 수준에 따라 토픽 비중이 유의하게 달라지는지 추정해 시각화
 
-| 그림 | 내용 |
+**장점, 단점 리뷰의 토픽별 비중과 대표 단어**
+
+| 장점 | 단점 |
 |---|---|
-| `figures/pros_topic_summary.png`, `figures/cons_topic_summary.png` | 장점, 단점 리뷰의 토픽별 비중과 대표 단어 |
-| `figures/pros_reg_sig_highlight.png`, `figures/cons_reg_sig_highlight.png` | 만족 수준에 따른 토픽 비중 차이 (유의한 토픽 강조) |
+| ![장점 토픽 비중](stm-public-servant-reviews/figures/pros_topic_summary.png) | ![단점 토픽 비중](stm-public-servant-reviews/figures/cons_topic_summary.png) |
+
+**만족 수준에 따른 토픽 비중 차이** (유의한 토픽 강조)
+
+| 장점 | 단점 |
+|---|---|
+| ![장점 공변량 효과](stm-public-servant-reviews/figures/pros_reg_sig_highlight.png) | ![단점 공변량 효과](stm-public-servant-reviews/figures/cons_reg_sig_highlight.png) |
 
 ## LLM 합성 데이터로 분류 모형 학습
 
@@ -48,3 +55,14 @@
 - 이미지 인코딩, 프롬프트 구성, API 호출과 오류 처리를 클래스로 묶어 전체 이미지를 일괄 분석
 - 정답 라벨과 비교해 정확도, 정밀도, 재현율, F1, 혼동행렬을 계산
 - 실행 시 환경변수 `OPENAI_API_KEY`에 API 키 필요
+
+**결과** (저장해 둔 GPT-4o 응답 32개로 재평가, 밈 8개 × 프롬프트 4종)
+
+| 프롬프트 | 정확도 | 정밀도 | 재현율 | F1 |
+|---|---|---|---|---|
+| 이미지 + 텍스트 + 한국 예능 맥락 | .875 | 1.000 | .750 | .857 |
+| 이미지 + 텍스트 | .857 | .750 | 1.000 | .857 |
+| 텍스트만 | .750 | .667 | 1.000 | .800 |
+| 이미지만 | .625 | .571 | 1.000 | .727 |
+
+- 감성 라벨을 읽을 수 없는 응답 1개는 평가에서 제외
